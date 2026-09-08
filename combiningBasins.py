@@ -933,18 +933,18 @@ def process_reservoir_basins():
     winner_counts = Counter(lake_to_winner.values())
     dup_winners = {w: c for w, c in winner_counts.items() if c > 1}
     if dup_winners:
-        print("=== 警告：以下winner LINKNO被多个湖共用 ===")
+        print("LINKNO has been reused")
         for w in dup_winners:
             sharing = [l for l, ww in lake_to_winner.items() if ww == w]
-            print(f"  winner {w} 被这些湖共用: {sharing}")
+            print(f" {w} sharing by: {sharing}")
 
     all_links_flat = [link for links in lake_to_links.values() for link in links]
     dup_links = {lnk: c for lnk, c in Counter(all_links_flat).items() if c > 1}
     if dup_links:
-        print("=== 警告：以下link被多个湖同时认领 ===")
+        print("link has been reused")
         for lnk in dup_links:
             owners = [l for l, links in lake_to_links.items() if lnk in links]
-            print(f"  link {lnk} 被这些湖同时认领: {owners}")
+            print(f" {lnk} sharing by {owners}")
     
     print("Merging segments and recalculating hydrometric statistics...")
     streams_work = streams.copy()
@@ -976,32 +976,10 @@ def process_reservoir_basins():
 
     apply_lake_metrics(streams_dissolved, lake_metrics)
 
-    try:
-        streams_dissolved = rewire_dissolved_topology(
+    streams_dissolved = rewire_dissolved_topology(
             streams_dissolved, down_map, swallowed_map, lake_to_winner
     )
-    except ValueError:
-        print("=== 环路诊断信息（崩溃前打印）===")
-        suspect_pairs = [(478, 8285), (6255, 6319), (13107, 13171),
-                          (64, 7104), (9856, 9920), (10095, 10223), (2560, 8640)]
-        for a, b in suspect_pairs:
-            a_winner_for = [l for l, w in lake_to_winner.items() if w == a]
-            b_winner_for = [l for l, w in lake_to_winner.items() if w == b]
-            print(f"--- 配对 ({a}, {b}) ---")
-            print(f"  {a}: down_map={down_map.get(a)}; swallowed_map={swallowed_map.get(a)}; 是winner的湖={a_winner_for}")
-            print(f"  {b}: down_map={down_map.get(b)}; swallowed_map={swallowed_map.get(b)}; 是winner的湖={b_winner_for}")
-            for lid in a_winner_for:
-                print(f"  湖{lid}(赢家{a})的internal_links是否包含{b}: {b in lake_to_links.get(lid, [])}")
-            for lid in b_winner_for:
-                print(f"  湖{lid}(赢家{b})的internal_links是否包含{a}: {a in lake_to_links.get(lid, [])}")
-            x = a
-            for step in range(4):
-                nxt = down_map.get(x)
-                print(f"  第{step}步: {x} -> {nxt} (swallowed_map[{nxt}]={swallowed_map.get(nxt)})")
-                if nxt is None:
-                    break
-                x = nxt
-        raise
+    
     streams_dissolved = streams_dissolved.drop(columns=["USLINKNO1", "USLINKNO2"], errors="ignore")
 
     # --- E. Assemble final basin fabric ---
