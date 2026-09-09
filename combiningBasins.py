@@ -1,7 +1,7 @@
 """
 Merge lake-split subbasins and internal stream links into unified reservoir units.
 
-Called by tau-dem-delineation-srun.slurm after TauDEM Pass 3 and before
+Called by Delineation-Workflow.slurm after TauDEM Pass 3 and before
 cleanGeofabric.py.
 
 Problem being solved
@@ -41,27 +41,26 @@ D. STREAM TOPOLOGY REWIRING & HYDROMETRIC AGGREGATION
    compute_lake_path_metrics() traces the longest inflow-to-outlet path through
      each lake and recalculates Length, strmDrop, StraightL, DOUTEND/START/MID,
      and Slope for the merged link
-   Rewire DSLINKNO: walk original down_map off the swallowed set; never
-     write W→X and X→W (or W→W). Domain exit is -1 only.
+   Rewire DSLINKNO so merged lake links drain to the link downstream of the winner
 
 E. BASIN FABRIC ASSEMBLY
    Remove swallowed subbasin polygons; append new reservoir catchment polygons
    Merged basin/stream primary ID remains the winning outlet LINKNO (DN / LINKNO)
-   export_shapefile() -> merged_basins/reservoirBasins.shp, reservoirStreams.shp
+   export_shapefile() -> outputs/working/basins_merged.shp, streams_merged.shp
 
 Inputs
 ------
-  delineation-product/final-delineated-watersheds.shp  (TauDEM Pass 3 basins)
-  delineation-product/final-delineated-streams.shp      (TauDEM Pass 3 streams)
-  lakes/filtered_lakes.shp                              (reservoir polygons)
-  taudem-interim-files/final/snapped-outlets.shp        (lake in/outflow points)
-  points/gauges_in_basin.shp
+  outputs/interim/taudem_pass3/final-delineated-watersheds.shp  (TauDEM Pass 3 basins)
+  outputs/interim/taudem_pass3/final-delineated-streams.shp      (TauDEM Pass 3 streams)
+  outputs/prep/lakes.shp                              (reservoir polygons)
+  outputs/interim/taudem_pass3/snapped-outlets.shp        (lake in/outflow points)
+  outputs/prep/gauges.shp
   outlet_overrides.csv (optional; shared with rasterFlowpathEdit.py)
 
 Outputs
 -------
-  merged_basins/reservoirBasins.shp   -> basins with lake units merged in
-  merged_basins/reservoirStreams.shp  -> streams with internal lake links dissolved
+  outputs/working/basins_merged.shp   -> basins with lake units merged in
+  outputs/working/streams_merged.shp  -> streams with internal lake links dissolved
 """
 
 import os
@@ -71,8 +70,21 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
-from rasterFlowpathEdit import load_overrides
-from collections import Counter
+from outlet_overrides import load_overrides
+from hy_features.config import hy_features_enabled
+from pipeline_paths import (
+    PATHS as PIPELINE_PATHS,
+    PREP_GAUGES,
+    PREP_LAKES,
+    SNAPPED_OUTLETS,
+    WORKING,
+    WORKING_BASINS_MERGED,
+    WORKING_CATCHMENT_REGISTRY,
+    WORKING_GEOFABRIC_GPKG,
+    WORKING_HYDRO_NETWORK_JSON,
+    WORKING_STREAMS_MERGED,
+    ensure_output_dirs,
+)
 
 # ==============================================================================
 # CONFIGURATION
@@ -80,14 +92,15 @@ from collections import Counter
 GAUGE_SEARCH_RADIUS = 750       # meters; max distance to count a gauge as "nearby"
 MIN_INTERNAL_STREAM_LEN = 180   # meters; stream-lake overlap length that triggers swallow
 OVERRIDES_CSV = "outlet_overrides.csv"
-OUTPUT_DIR = "merged_basins"
+OUTPUT_DIR = str(WORKING)
+ENABLE_HY_FEATURES = False      # overridden by HY_FEATURES_ENABLED env var if set
 
 PATHS = {
-    "basins": "delineation-product/final-delineated-watersheds.shp",
-    "streams": "delineation-product/final-delineated-streams.shp",
-    "lakes": "lakes/filtered_lakes.shp",
-    "intersection": "taudem-interim-files/final/snapped-outlets.shp",
-    "gauges": "points/gauges_in_basin.shp",
+    "basins": PIPELINE_PATHS["pass3_basins"],
+    "streams": PIPELINE_PATHS["pass3_streams"],
+    "lakes": str(PREP_LAKES),
+    "intersection": str(SNAPPED_OUTLETS),
+    "gauges": str(PREP_GAUGES),
 }
 
 
@@ -310,29 +323,6 @@ def select_winning_outflow_link(lake_id, surviving_candidates, overrides_gdf, ce
     return None if chosen is None else chosen["link_no"]
 
 
-def select_winner_from_lake_geometry(lake_geom, streams):
-    """
-    When snapped-outlets has only inflow points, pick the stream link that
-    leaves the lake polygon. Prefer a downstream tip outside the lake, then
-    higher strmOrder, then larger DSContArea.
-    """
-    hits = streams[streams.intersects(lake_geom)].copy()
-    if hits.empty:
-        return None
-
-    def exits_lake(row):
-        coords = list(row.geometry.coords)
-        if len(coords) < 2:
-            return False
-        return not lake_geom.contains(Point(coords[0]))
-
-    hits = hits.copy()
-    hits["_exits"] = hits.apply(exits_lake, axis=1)
-    sort_cols = [c for c in ["_exits", "strmOrder", "DSContArea"] if c in hits.columns]
-    hits = hits.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
-    return int(hits.iloc[0]["LINKNO"])
-
-
 # ==============================================================================
 # C. INTERNAL LINK IDENTIFICATION
 # ==============================================================================
@@ -399,68 +389,6 @@ def collect_internal_links(lake_geom, in_pts, raw_outflow_candidates, streams, b
         internal |= trace_downstream_links(sid, down_map, raw_outflow_candidates)
 
     return internal
-
-
-def path_reenters_set(start_id, down_map, internal):
-    """True if walking original DSLINKNO from start_id hits ``internal`` before outlet."""
-    seen = set()
-    x = start_id
-    while not _is_network_outlet(x):
-        try:
-            x = int(x)
-        except (TypeError, ValueError):
-            return False
-        if x in seen:
-            return False
-        seen.add(x)
-        if x in internal:
-            return True
-        x = down_map.get(x, -1)
-    return False
-
-
-def close_internal_along_winner_path(winner_id, internal, down_map):
-    """
-    Add sliver links that sit on the original path between the winner and
-    other links already swallowed into the same lake.
-
-    Diagnostic pattern: W=478 → 8285 (not swallowed) → 8349 (swallowed into W).
-    8285 must join the lake unit so the reservoir polygon actually contains
-    the outlet path and W does not point at a leftover sliver that then
-    points back at W.
-    """
-    closed = set(int(x) for x in internal if x is not None)
-    try:
-        winner_id = int(winner_id)
-    except (TypeError, ValueError):
-        return closed
-    closed.add(winner_id)
-    x = down_map.get(winner_id, -1)
-    seen = set()
-    added = []
-    while not _is_network_outlet(x):
-        try:
-            x = int(x)
-        except (TypeError, ValueError):
-            break
-        if x in seen:
-            break
-        seen.add(x)
-        if x in closed:
-            x = down_map.get(x, -1)
-            continue
-        if path_reenters_set(down_map.get(x, -1), down_map, closed):
-            closed.add(x)
-            added.append(x)
-            x = down_map.get(x, -1)
-            continue
-        break
-    if added:
-        print(
-            f"Lake winner {winner_id}: swallowed {len(added)} outlet-path sliver(s) "
-            f"{added[:12]}{'...' if len(added) > 12 else ''}"
-        )
-    return closed
 
 
 # ==============================================================================
@@ -567,140 +495,6 @@ def build_stream_agg_logic(streams):
     return agg_logic
 
 
-def _is_network_outlet(link_id):
-    """TauDEM terminal marker: missing, -1, or 0."""
-    if link_id is None or (isinstance(link_id, float) and pd.isna(link_id)):
-        return True
-    try:
-        return int(link_id) <= 0
-    except (TypeError, ValueError):
-        return True
-
-
-def first_surviving_downstream(start_id, down_map, swallowed_map, self_id):
-    """
-    Walk the *original* DSLINKNO chain from start_id until a link that still
-    exists after dissolve.
-
-    A link exists after dissolve when it was never swallowed, or when it is
-    a lake winner (swallowed_map[id] == id). Links swallowed into self_id are
-    skipped. Another lake's winner is a valid exit.
-    """
-    if _is_network_outlet(start_id):
-        return -1
-    seen = set()
-    x = int(start_id)
-    while not _is_network_outlet(x):
-        if x in seen:
-            return -1
-        seen.add(x)
-        mapped = swallowed_map.get(x)
-        if mapped is None:
-            return int(x)
-        mapped = int(mapped)
-        if mapped != int(self_id):
-            return mapped
-        x = down_map.get(x, -1)
-        if _is_network_outlet(x):
-            return -1
-        try:
-            x = int(x)
-        except (TypeError, ValueError):
-            return -1
-    return -1
-
-
-def rewire_dissolved_topology(streams_dissolved, down_map, swallowed_map, lake_to_winner):
-    """
-    Set DSLINKNO after lake dissolve without creating self-loops or 2-cycles.
-
-    1. Each winner W points at the first original-downstream link that is not
-       swallowed into W (domain exit -> -1).
-    2. Any other link that pointed at a swallowed id is retargeted to that
-       lake's winner, unless that would make W → X → W; then X points at
-       the same exit D as W.
-    """
-    winner_ids = {int(w) for w in lake_to_winner.values() if w is not None}
-    winner_down = {}
-    for winner_id in winner_ids:
-        orig = down_map.get(int(winner_id), -1)
-        winner_down[int(winner_id)] = first_surviving_downstream(
-            orig, down_map, swallowed_map, int(winner_id)
-        )
-
-    new_down = []
-    for link_no, ds_id in zip(
-        streams_dissolved["LINKNO"].to_numpy(),
-        streams_dissolved["DSLINKNO"].to_numpy(),
-    ):
-        try:
-            link_no = int(link_no)
-        except (TypeError, ValueError):
-            new_down.append(-1)
-            continue
-        if link_no in winner_down:
-            new_down.append(int(winner_down[link_no]))
-            continue
-        if _is_network_outlet(ds_id):
-            new_down.append(-1)
-            continue
-        try:
-            ds_id = int(ds_id)
-        except (TypeError, ValueError):
-            new_down.append(-1)
-            continue
-        if ds_id not in swallowed_map:
-            new_down.append(ds_id)
-            continue
-        target = int(swallowed_map[ds_id])
-        if winner_down.get(target) == link_no:
-            # X sits between W and W's swallowed trunk. Do not write X→W.
-            new_down.append(
-                first_surviving_downstream(
-                    down_map.get(link_no, -1), down_map, swallowed_map, target
-                )
-            )
-        else:
-            new_down.append(target)
-
-    out = streams_dissolved.copy()
-    out["DSLINKNO"] = new_down
-
-    # Report leftover cycles instead of inventing outlets.
-    succ = dict(zip(out["LINKNO"].astype(int), out["DSLINKNO"].astype(int)))
-    leftover = []
-    seen_global = set()
-    for start in succ:
-        if start in seen_global:
-            continue
-        stack = []
-        onstack = {}
-        x = start
-        while x in succ and not _is_network_outlet(x):
-            if x in onstack:
-                leftover.append(stack[onstack[x]:])
-                break
-            if x in seen_global:
-                break
-            onstack[x] = len(stack)
-            stack.append(x)
-            seen_global.add(x)
-            x = succ[x]
-    if leftover:
-        cores = []
-        keys = set()
-        for cyc in leftover:
-            key = frozenset(cyc)
-            if key not in keys:
-                keys.add(key)
-                cores.append(cyc)
-        raise ValueError(
-            "Lake rewire still produced DSLINKNO cycle(s): "
-            f"{cores[:10]}. Inspect swallowed links for these IDs."
-        )
-    return out
-
-
 def apply_lake_metrics(streams_dissolved, lake_metrics):
     """Assign path-traced hydrometric values and recalculate Slope on merged links."""
     for merged_id, metrics in lake_metrics.items():
@@ -722,47 +516,10 @@ def apply_lake_metrics(streams_dissolved, lake_metrics):
 # E. EXPORT
 # ==============================================================================
 def export_shapefile(gdf, filename):
-    """
-    Write a shapefile with type-aware numeric formatting.
+    """Write a shapefile with short column names and wide DBF numeric fields."""
+    from hy_features.export import export_shapefile_legacy
 
-    Float columns are rounded to 3 decimal places (Slope is left unrounded).
-    Integer columns are preserved as ints. Wide float fields use float:24.3
-    in the Fiona schema to avoid DBF truncation. Falls back to string columns
-    if the schema export fails.
-    """
-    export_gdf = gdf.copy()
-
-    float_cols = export_gdf.select_dtypes(include=["float64", "float32"]).columns
-    for col in float_cols:
-        if col != "Slope":
-            export_gdf[col] = pd.to_numeric(export_gdf[col], errors="coerce").fillna(0.0).round(3)
-
-    if "Slope" in export_gdf.columns:
-        export_gdf["Slope"] = pd.to_numeric(export_gdf["Slope"], errors="coerce").fillna(0.0)
-
-    int_cols = export_gdf.select_dtypes(include=["int64", "int32"]).columns
-    for col in int_cols:
-        export_gdf[col] = export_gdf[col].fillna(-1).astype(int)
-
-    schema = gpd.io.file.infer_schema(export_gdf)
-    for col in float_cols:
-        if col not in schema["properties"]:
-            continue
-        if col == "Slope":
-            continue
-        if col == "lake_area":
-            schema["properties"][col] = "float:24.1"
-        else:
-            schema["properties"][col] = "float:24.3"
-
-    try:
-        export_gdf.to_file(filename, driver="ESRI Shapefile", schema=schema, engine="fiona")
-    except Exception as exc:
-        print(f"Fiona export failed for {filename}, attempting fallback. Error: {exc}")
-        for col in list(float_cols) + list(int_cols):
-            if col in export_gdf.columns:
-                export_gdf[col] = export_gdf[col].astype(str)
-        export_gdf.to_file(filename, driver="ESRI Shapefile")
+    export_shapefile_legacy(gdf, filename)
 
 
 # ==============================================================================
@@ -787,7 +544,9 @@ def process_reservoir_basins():
     lakes = gpd.read_file(PATHS["lakes"])
     streams = gpd.read_file(PATHS["streams"])
     intersection = gpd.read_file(PATHS["intersection"])
-    gauges = gpd.read_file(PATHS["gauges"])
+    from hy_features.export import strip_point_join_artifacts
+
+    gauges = strip_point_join_artifacts(gpd.read_file(PATHS["gauges"]))
 
     intersection["lake_id"] = parse_lake_id_column(intersection)
 
@@ -822,55 +581,36 @@ def process_reservoir_basins():
 
     unique_lakes = intersection["lake_id"].unique()
     print(f"Processing {len(unique_lakes)} lakes...")
-    skipped_lakes = []
 
     # --- Per-lake processing ---
     for l_id in unique_lakes:
         if l_id < 0:
-            skipped_lakes.append((int(l_id), "lake_id < 0 in snapped-outlets"))
             continue
 
         out_pts = intersection[(intersection["lake_id"] == l_id) & (intersection["point_type"] == "outflow")]
         in_pts = intersection[(intersection["lake_id"] == l_id) & (intersection["point_type"] == "inflow")]
         lake_polys = lakes[lakes["Hylak_id"] == l_id]
-        if lake_polys.empty:
-            skipped_lakes.append((int(l_id), "no polygon in filtered_lakes.shp"))
+        if lake_polys.empty or out_pts.empty:
             continue
 
         lake_geom = lake_polys.geometry.iloc[0]
-        used_geom_outlet = False
 
-        if out_pts.empty:
-            winner_id = select_winner_from_lake_geometry(lake_geom, streams)
-            if winner_id is None:
-                skipped_lakes.append((int(l_id), "inflow only and no stream intersects the lake"))
-                continue
-            raw_outflow_candidates = {int(winner_id)}
-            used_geom_outlet = True
-            print(
-                f"Lake {int(l_id)}: no outflow point; using intersecting stream "
-                f"{winner_id} as outlet."
-            )
-        else:
-            outflow_candidates = build_outflow_candidates(
-                out_pts, streams, buffer_dist, link_to_dout, link_to_accum, link_to_strmorder, gauges,
-            )
-            if not outflow_candidates:
-                skipped_lakes.append((int(l_id), "outflow point did not snap to a stream LINKNO"))
-                continue
-            raw_outflow_candidates = {c["link_no"] for c in outflow_candidates}
-            surviving_candidates = filter_upstream_duplicate_outflows(
-                outflow_candidates, link_to_downstream
-            )
-            if not surviving_candidates:
-                skipped_lakes.append((int(l_id), "all outflow candidates dropped as upstream duplicates"))
-                continue
-            winner_id = select_winning_outflow_link(
-                l_id, surviving_candidates, overrides_gdf, cell_size
-            )
-            if winner_id is None:
-                skipped_lakes.append((int(l_id), "no winning outlet LINKNO"))
-                continue
+        # B. Outlet selection
+        outflow_candidates = build_outflow_candidates(
+            out_pts, streams, buffer_dist, link_to_dout, link_to_accum, link_to_strmorder, gauges,
+        )
+        if not outflow_candidates:
+            continue
+
+        # All outflow link IDs (used as stop points during internal link tracing)
+        raw_outflow_candidates = {c["link_no"] for c in outflow_candidates}
+        surviving_candidates = filter_upstream_duplicate_outflows(outflow_candidates, link_to_downstream)
+        if not surviving_candidates:
+            continue
+
+        winner_id = select_winning_outflow_link(l_id, surviving_candidates, overrides_gdf, cell_size)
+        if winner_id is None:
+            continue
 
         lake_to_outlet[l_id] = down_map.get(winner_id, -1)  # link downstream of the outlet
         lake_to_winner[l_id] = winner_id
@@ -883,14 +623,10 @@ def process_reservoir_basins():
         # Always swallow the winning outlet link so the merged unit keeps that DN
         # and the original winner polygon is not left behind.
         internal_links.add(winner_id)
-        internal_links = close_internal_along_winner_path(
-            winner_id, internal_links, down_map
-        )
 
         # Union subbasins whose DN matches swallowed internal links
         swallowed_basins = basins[basins["DN"].isin(internal_links)]
         if swallowed_basins.empty:
-            skipped_lakes.append((int(l_id), f"no basin polygon with DN in internal links (winner={winner_id})"))
             continue
 
         lake_to_links[l_id] = list(internal_links)
@@ -898,14 +634,15 @@ def process_reservoir_basins():
 
         merged_geom = swallowed_basins.geometry.union_all()
 
-        # HydroLAKES Lake_area is km²
+        # HydroLAKES Lake_area is km²; convert to m² for the routing model
         lake_area_km2 = float(pd.to_numeric(lake_polys.iloc[0]["Lake_area"], errors="coerce") or 0.0)
-        basin_area_km2 = float(merged_geom.area) / 1e6
-        intersection_geom = merged_geom.intersection(lake_geom)
-        lake_in_basin_km2 = float(intersection_geom.area) / 1e6
+        lake_area_m2 = lake_area_km2 * 1e6
+        basin_area_m2 = float(merged_geom.area)
 
-        if basin_area_km2 > 0:
-            fractional_lake_in_basin = lake_in_basin_km2 / basin_area_km2
+        # Fraction of the merged basin covered by lake (works if basins are later split)
+        intersection_geom = merged_geom.intersection(lake_geom)
+        if basin_area_m2 > 0:
+            fractional_lake_in_basin = float(intersection_geom.area / basin_area_m2)
         else:
             fractional_lake_in_basin = 0.0
         fractional_lake_in_basin = max(0.0, min(1.0, fractional_lake_in_basin))
@@ -915,37 +652,15 @@ def process_reservoir_basins():
         catchment_results.append({
             "DN": int(winner_id),
             "lake_id": l_id,
+            "lake_type": int(pd.to_numeric(lake_polys.iloc[0]["Lake_type"], errors="coerce") or 1),
             "geometry": merged_geom,
             "is_lake": 1,
             # Shapefile DBF fields are limited to 10 characters
-            "lake_area": lake_area_km2,  # km²
+            "lake_area": lake_area_m2,  # m²
             "frac_lake": fractional_lake_in_basin,
-            "outlet_src": "geom" if used_geom_outlet else "point",
         })
 
     # --- D. Stream dissolve, hydrometric aggregation, and topology rewire ---
-    if skipped_lakes:
-        print(f"Skipped {len(skipped_lakes)} lake(s) that will NOT have a reservoir unit:")
-        for lid, reason in skipped_lakes:
-            print(f"  Hylak_id={lid}: {reason}")
-    
-    from collections import Counter
-    winner_counts = Counter(lake_to_winner.values())
-    dup_winners = {w: c for w, c in winner_counts.items() if c > 1}
-    if dup_winners:
-        print("LINKNO has been reused")
-        for w in dup_winners:
-            sharing = [l for l, ww in lake_to_winner.items() if ww == w]
-            print(f" {w} sharing by: {sharing}")
-
-    all_links_flat = [link for links in lake_to_links.values() for link in links]
-    dup_links = {lnk: c for lnk, c in Counter(all_links_flat).items() if c > 1}
-    if dup_links:
-        print("link has been reused")
-        for lnk in dup_links:
-            owners = [l for l, links in lake_to_links.items() if lnk in links]
-            print(f" {lnk} sharing by {owners}")
-    
     print("Merging segments and recalculating hydrometric statistics...")
     streams_work = streams.copy()
     lake_metrics = {}
@@ -976,10 +691,15 @@ def process_reservoir_basins():
 
     apply_lake_metrics(streams_dissolved, lake_metrics)
 
-    streams_dissolved = rewire_dissolved_topology(
-            streams_dissolved, down_map, swallowed_map, lake_to_winner
-    )
-    
+    # Point each merged lake link at the link immediately downstream of the winner
+    for l_id, ds_id in lake_to_outlet.items():
+        winner_id = lake_to_winner.get(l_id)
+        if winner_id is None:
+            continue
+        streams_dissolved.loc[streams_dissolved["LINKNO"] == int(winner_id), "DSLINKNO"] = ds_id
+
+    # Redirect any DSLINKNO that pointed to a swallowed link to the merged winner ID
+    streams_dissolved["DSLINKNO"] = streams_dissolved["DSLINKNO"].replace(swallowed_map)
     streams_dissolved = streams_dissolved.drop(columns=["USLINKNO1", "USLINKNO2"], errors="ignore")
 
     # --- E. Assemble final basin fabric ---
@@ -993,12 +713,49 @@ def process_reservoir_basins():
     )
     final_geofabric["is_lake"] = final_geofabric["is_lake"].fillna(0).astype(int)
     final_geofabric["lake_id"] = final_geofabric["lake_id"].fillna(-1).astype(int)
+    if "lake_type" not in final_geofabric.columns:
+        final_geofabric["lake_type"] = -1
+    else:
+        final_geofabric["lake_type"] = (
+            pd.to_numeric(final_geofabric["lake_type"], errors="coerce").fillna(-1).astype(int)
+        )
     final_geofabric["lake_area"] = final_geofabric["lake_area"].fillna(0.0)
     final_geofabric["frac_lake"] = final_geofabric["frac_lake"].fillna(0.0)
 
+    ensure_output_dirs()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    export_shapefile(final_geofabric, f"{OUTPUT_DIR}/reservoirBasins.shp")
-    export_shapefile(streams_dissolved, f"{OUTPUT_DIR}/reservoirStreams.shp")
+
+    waterbodies = None
+    try:
+        waterbodies = gpd.read_file(PATHS["lakes"])
+        if waterbodies.crs != target_crs:
+            waterbodies = waterbodies.to_crs(target_crs)
+    except Exception:
+        pass
+
+    if hy_features_enabled(default=ENABLE_HY_FEATURES):
+        from hy_features.assemble import assemble_full_geofabric, export_full_geofabric
+        from hy_features.export import export_shapefile_legacy
+
+        assembled = assemble_full_geofabric(
+            final_geofabric,
+            streams_dissolved,
+            gauges=gauges,
+            waterbodies=waterbodies,
+        )
+
+        export_full_geofabric(
+            assembled,
+            gpkg_path=str(WORKING_GEOFABRIC_GPKG),
+            registry_path=str(WORKING_CATCHMENT_REGISTRY),
+            metadata_path=str(WORKING_HYDRO_NETWORK_JSON),
+        )
+
+        export_shapefile_legacy(assembled["layers"]["catchment_area"], str(WORKING_BASINS_MERGED))
+        export_shapefile_legacy(assembled["layers"]["flowpath"], str(WORKING_STREAMS_MERGED))
+    else:
+        export_shapefile(final_geofabric, str(WORKING_BASINS_MERGED))
+        export_shapefile(streams_dissolved, str(WORKING_STREAMS_MERGED))
     print("Processing complete.")
 
 
