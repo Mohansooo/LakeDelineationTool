@@ -2,12 +2,10 @@
 Aggregate small sub-basins and stream reaches for TauDEM / cleanGeofabric outputs.
 
 Expected inputs (defaults match cleanGeofabric.py outputs):
-  merged_basins/reservoirBasins_final.shp
-  merged_basins/reservoirStreams_final.shp
+  outputs/final/basins.shp
+  outputs/final/streams.shp
 
-Rule H / Rule I lookups are inverted-index replacements of the original
-``basin.loc[basin[col] == key]`` scans. Merge order, predicates, and the
-read-after-write sequence inside Rule I are unchanged.
+
 """
 
 from __future__ import annotations
@@ -20,32 +18,58 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+from pipeline_paths import (
+    FINAL_BASINS,
+    FINAL_BASINS_AGG,
+    FINAL_STREAMS,
+    FINAL_STREAMS_AGG,
+    ensure_output_dirs,
+)
+
 
 # ==============================================================================
-# COLUMN NAMES — edit these to match your shapefile attribute tables
+# COLUMN NAMES — legacy TauDEM/MESH fields on disk; canonical HY_Features names
+# are added by hy_features.enrich. See docs/hy_features_mapping.md.
 # ==============================================================================
-# Shared topology
-BASIN_ID = "DN"             # primary basin object id
-RIVER_ID = "LINKNO"             # stream reach ID
-NEXT_DOWN_ID = "DSLINKNO"       # downstream link / basin ID (outlet sentinel below)
+from hy_features.schema import (
+    FRAC_LAKE,
+    LEGACY_BASIN_ID,
+    LEGACY_FLOWPATH_ID,
+    LEGACY_GAUGE_IDS,
+    LEGACY_IS_LAKE,
+    LEGACY_LAKE_AREA,
+    LEGACY_LAKE_ID,
+    LEGACY_LOWER_ID,
+)
 
-# Basin areas (km² after conversion; see AREA_SCALE)
-UNIT_AREA: Optional[str] = None  # local sub-basin area; None -> polygon area
-UP_AREA = "DSContArea"           # cumulative drainage area at pour point
+BASIN_ID = LEGACY_BASIN_ID
+RIVER_ID = LEGACY_FLOWPATH_ID
+NEXT_DOWN_ID = LEGACY_LOWER_ID
+GAUGE_IDS = LEGACY_GAUGE_IDS
+LAKE_FLAG = LEGACY_IS_LAKE
+LAKE_ID = LEGACY_LAKE_ID
+LAKE_AREA = LEGACY_LAKE_AREA
+FRAC_LAKE_AREA = FRAC_LAKE
+
+# Basin areas — see module docstring "Area columns"
+#
+# UNIT_AREA: optional shapefile column for *local* subbasin area (one polygon only).
+#   None (default) — compute from basin polygon geometry (recommended for this pipeline).
+#   "SomeCol"      — read from basins, or from rivers if joined by DN/LINKNO.
+#   Values are multiplied by AREA_SCALE (1e-6) so m² fields become km² for MIN_SUB_AREA.
+#   After aggregation, summed local areas are written as area_km2 (or UNIT_AREA name).
+#
+# UP_AREA (DSContArea): TauDEM *cumulative* drainage area at each pour point (m² on disk).
+#   Not used for the "too small to keep" test — only for outlet / mask logic.
+UNIT_AREA: Optional[str] = None
+UP_AREA = "DSContArea"
 
 # River hydraulics
 SLOPE = "Slope"
 LENGTH = "Length"                # reach length; converted with LENGTH_SCALE
 
 # Masking / special units
-LAKE_FLAG = "is_lake"            # >0 marks reservoir/lake sub-basins (not aggregated)
 GAUGE_FLAG: Optional[str] = None  # numeric 0/1 column; None -> derive from GAUGE_IDS
-GAUGE_IDS = "STATION_NU"         # gauge attribute only (not the basin object id)
-
-# Basin attributes carried through to aggregated output (from pour-point basin)
-LAKE_ID = "lake_id"
-LAKE_AREA = "lake_area"          # km² (shapefile-safe name, ≤10 chars)
-FRAC_LAKE_AREA = "frac_lake"     # fraction of basin covered by lake (geom intersection / basin area)
 
 # Extra river attributes carried through to aggregated output
 STREAM_ORDER = "strmOrder"
@@ -59,12 +83,12 @@ LENGTH_SCALE = 1e-3              # m -> km for TauDEM Length
 # ==============================================================================
 # INPUT / OUTPUT PATHS AND THRESHOLDS
 # ==============================================================================
-INPUT_BASINS = "merged_basins/reservoirBasins_final.shp"
-INPUT_RIVERS = "merged_basins/reservoirStreams_final.shp"
-OUTPUT_BASINS = "final_basin/aggregated_basins.shp"
-OUTPUT_RIVERS = "final_basin/aggregated_rivers.shp"
+INPUT_BASINS = str(FINAL_BASINS)
+INPUT_RIVERS = str(FINAL_STREAMS)
+OUTPUT_BASINS = str(FINAL_BASINS_AGG)
+OUTPUT_RIVERS = str(FINAL_STREAMS_AGG)
 
-MIN_SUB_AREA = 90.0          # km²
+MIN_SUB_AREA = 100.0          # km² — merge subbasins whose local area (_unitarea) is below this
 MIN_RIV_SLOPE = 0.0000001     # minimum accepted river slope (WATFLOOD manual)
 MIN_RIV_LENGTH = 1.0          # km
 
@@ -102,6 +126,26 @@ def _basin_attr_cols(basin: gpd.GeoDataFrame) -> list[str]:
   return [c for c in candidates if c in basin.columns]
 
 
+def _one_row_per_agg(
+  basin: gpd.GeoDataFrame,
+  id_col: str,
+  cols: list[str],
+) -> pd.DataFrame:
+  """
+  One attribute row per aggregate id.
+
+  Prefer the pour-point row (DN == agg); fall back to any row in the group when
+  the survivor id is not present as a basin DN (common after headwater merges).
+  """
+  available = ["agg"] + [c for c in cols if c in basin.columns and c != "agg"]
+  pour = basin.loc[basin[id_col] == basin["agg"], available].drop_duplicates(subset=["agg"])
+  missing = set(basin["agg"].unique()) - set(pour["agg"])
+  if missing:
+    fallback = basin.loc[basin["agg"].isin(missing), available].drop_duplicates(subset=["agg"])
+    pour = pd.concat([pour, fallback], ignore_index=True)
+  return pour
+
+
 def _is_outlet_id(down_id: object, outlet_value: int) -> bool:
   """Return True for outlet sentinels (configured value, or legacy <= 0)."""
   try:
@@ -112,67 +156,12 @@ def _is_outlet_id(down_id: object, outlet_value: int) -> bool:
 
 
 def _is_sentinel_object_id(obj_id: object, outlet_value: int) -> bool:
-  """True if ``obj_id`` cannot be a basin/reach identifier.
-
-  DSLINKNO uses ``_is_outlet_id`` (0 / negative / sentinel all mean outlet).
-  LINKNO/DN/agg may legitimately be 0 in TauDEM — only the configured
-  sentinel and negative IDs are illegal object ids.
-  """
+  """True if obj_id cannot be a basin/reach identifier (sentinel or negative)."""
   try:
     val = int(obj_id)
   except (TypeError, ValueError):
     return True
   return val == int(outlet_value) or val < 0
-
-
-def _to_int64_link_ids(
-  series: pd.Series,
-  outlet_value: int,
-  label: str,
-  *,
-  fill_outlets: bool = True,
-) -> pd.Series:
-  """
-  Cast topology IDs to int64.
-
-  ``fill_outlets=True`` is only for downstream pointers (DSLINKNO): NaN/inf
-  become the outlet sentinel. Never use that fill on object IDs (LINKNO /
-  DN) — a sentinel is not a basin id and would dissolve every unattached
-  edge unit into one polygon.
-  """
-  numeric = pd.to_numeric(series, errors="coerce")
-  bad = numeric.isna() | np.isinf(numeric.to_numpy())
-  n_bad = int(bad.sum())
-  if n_bad:
-    if not fill_outlets:
-      raise ValueError(
-        f"{n_bad} non-finite value(s) in {label}; refusing to invent basin IDs."
-      )
-    print(
-      f"Warning: {n_bad} non-finite value(s) in {label}; "
-      f"writing outlet sentinel {int(outlet_value)}."
-    )
-    numeric = numeric.mask(bad, int(outlet_value))
-  return numeric.astype("int64")
-
-
-def _pour_point_down(basin: gpd.GeoDataFrame, id_col: str) -> pd.DataFrame:
-  """
-  One (agg, aggdown) row per aggregate: prefer the true pour-point
-  ``id_col == agg``. Groups that lost that row (absorbed representative)
-  fall back to the member with largest ``_uparea``.
-  """
-  pour = basin.loc[basin[id_col] == basin["agg"], ["agg", "aggdown"]].copy()
-  missing_mask = ~basin["agg"].isin(pour["agg"])
-  if missing_mask.any():
-    fallback = (
-      basin.loc[missing_mask, ["agg", "aggdown", "_uparea"]]
-      .sort_values("_uparea", ascending=True)
-      .groupby("agg", as_index=False)
-      .tail(1)[["agg", "aggdown"]]
-    )
-    pour = pd.concat([pour, fallback], ignore_index=True)
-  return pour.drop_duplicates(subset=["agg"], keep="first")
 
 
 def _remap_aggdown_to_survivors(
@@ -257,6 +246,32 @@ def _validate_topology(
     )
 
 
+def _downstream_basin_ids_of_lakes(
+  basin: gpd.GeoDataFrame,
+  river: gpd.GeoDataFrame,
+  id_col: str,
+  down_col: str,
+  riv_id_col: str,
+  outlet_value: int = OUTLET_VALUE,
+) -> set[int]:
+  """LINKNO/DN ids for basins immediately downstream of a lake outlet link."""
+  lake_ids = set(basin.loc[basin["_lake_cat"] > 0, id_col].astype(int))
+  if not lake_ids:
+    return set()
+
+  protected: set[int] = set()
+  link_series = river[riv_id_col].astype(int)
+  for lake_id in lake_ids:
+    down_rows = river.loc[link_series == lake_id, down_col]
+    if down_rows.empty:
+      continue
+    down_id = down_rows.iloc[0]
+    if _is_outlet_id(down_id, outlet_value):
+      continue
+    protected.add(int(down_id))
+  return protected
+
+
 def prepare_input_tables(
   input_basin: gpd.GeoDataFrame,
   input_river: gpd.GeoDataFrame,
@@ -289,7 +304,14 @@ def prepare_input_tables(
     how="left",
     suffixes=("", "_riv"),
   )
+  if NEXT_DOWN_ID in basin.columns:
+    basin[NEXT_DOWN_ID] = (
+      pd.to_numeric(basin[NEXT_DOWN_ID], errors="coerce")
+      .fillna(OUTLET_VALUE)
+      .astype(int)
+    )
 
+  # Local subbasin area (km²) used for MIN_SUB_AREA merge decisions.
   if UNIT_AREA and UNIT_AREA in basin.columns:
     basin["_unitarea"] = _area_km2(basin[UNIT_AREA], AREA_SCALE)
   elif UNIT_AREA and UNIT_AREA in river.columns:
@@ -297,6 +319,7 @@ def prepare_input_tables(
   else:
     basin["_unitarea"] = basin.geometry.area * AREA_SCALE
 
+  # Cumulative upstream area at pour point (TauDEM DSContArea); separate from local area.
   if UP_AREA in basin.columns:
     basin["_uparea"] = _area_km2(basin[UP_AREA], AREA_SCALE)
   else:
@@ -343,10 +366,9 @@ def prepare_input_tables(
 
 
 # ==============================================================================
-# INDEXED LOOKUPS (observationally equivalent to boolean masks)
+# INDEXED LOOKUPS — same writes as basin.loc[basin[col] == key]
 # ==============================================================================
 def _index_labels_by_value(series: pd.Series) -> dict[Any, list[Hashable]]:
-  """Map each value to index *labels* in DataFrame index order."""
   out: dict[Any, list[Hashable]] = defaultdict(list)
   for lab, val in series.items():
     out[val].append(lab)
@@ -354,7 +376,6 @@ def _index_labels_by_value(series: pd.Series) -> dict[Any, list[Hashable]]:
 
 
 def _index_first_label(series: pd.Series) -> dict[Any, Hashable]:
-  """Map each value to the first index label (same as ``df[df[col]==v].index[0]``)."""
   out: dict[Any, Hashable] = {}
   for lab, val in series.items():
     if val not in out:
@@ -368,7 +389,6 @@ def _reassign_aggdown(
   labels: list[Hashable],
   new_val: object,
 ) -> None:
-  """Set ``aggdown`` on ``labels`` and keep ``aggdown_index`` in sync."""
   if not labels:
     return
   old_vals = basin.loc[labels, "aggdown"]
@@ -386,29 +406,17 @@ def _reassign_aggdown(
   aggdown_index[new_val].extend(labels)
 
 
-def rule_H_indexed(
+def absorb_headwater_groups(
   basin: gpd.GeoDataFrame,
   xx_df: pd.DataFrame,
   outlet_value: int = OUTLET_VALUE,
 ) -> gpd.GeoDataFrame:
-  """
-  Absorb headwater groups listed in ``xx_df``.
-
-  Equivalent to the original loop::
-
-      basin.loc[basin["agg"] == aggold, "aggdown"] = new_aggdown
-      basin.loc[basin["agg"] == aggold, "agg"] = new_agg
-
-  Candidates in one Rule H pass are disjoint from each other's merge
-  targets, so a snapshot-style move of each ``aggold`` group is exact.
-  """
+  """Same as: loc[agg==aggold, aggdown]=...; loc[agg==aggold, agg]=..."""
   agg_index = _index_labels_by_value(basin["agg"])
   for i in range(len(xx_df)):
     aggold = xx_df["aggold"].iloc[i]
     new_agg = xx_df["agg"].iloc[i]
     new_aggdown = xx_df["aggdown"].iloc[i]
-    # Outlet sentinels are not basin IDs. Absorbing every coastal / missing
-    # downstream into -9999 is what glued the map edge into one polygon.
     if pd.isna(new_agg) or _is_sentinel_object_id(new_agg, outlet_value):
       continue
     labels = agg_index.get(aggold)
@@ -423,35 +431,14 @@ def rule_H_indexed(
   return basin
 
 
-def rule_I_indexed(
+def absorb_internal_groups(
   basin: gpd.GeoDataFrame,
   small_subbasin: pd.DataFrame,
   id_col: str,
   down_col: str,
   min_sub_area: float,
-  outlet_value: int = OUTLET_VALUE,
 ) -> gpd.GeoDataFrame:
-  """
-  Absorb internal (non-headwater) small groups, preserving the original
-  per-statement read-after-write sequence.
-
-  Original body (one candidate per iteration)::
-
-      xx = basin[basin[id_col] == cand].index[0]
-      if sum(_unitarea where agg == basin.loc[xx, agg]) < min_sub_area:
-          xy = basin[basin[down_col] == basin.loc[xx, id_col]].index
-          xz = xy rows with max _uparea
-          if Mask[xz] < 2:
-              zz = rows where aggdown == basin.loc[xz, agg]   # BEFORE writes
-              # line 1: rows where agg == xz.agg  -> agg = xx.agg
-              # line 2: rows where agg == xz.agg  -> aggdown = xx.aggdown
-              #         (xz.agg is re-read AFTER line 1)
-              # zz.aggdown = xx.agg
-
-  ``id_col`` / ``down_col`` never change inside the while loop; ``agg`` and
-  ``aggdown`` indexes are updated after every write so later candidates in
-  this same ``for`` see the mutated state.
-  """
+  """Same statements and read-after-write order as the original internal-merge loop."""
   id_first = _index_first_label(basin[id_col])
   down_index = _index_labels_by_value(basin[down_col])
   agg_index = _index_labels_by_value(basin["agg"])
@@ -461,12 +448,10 @@ def rule_I_indexed(
     cand = small_subbasin["agg"].iloc[i]
     if cand not in id_first:
       raise IndexError(
-        f"Rule I: no row with {id_col}=={cand!r} (matches original .index[0] failure)"
+        f"internal merge: no row with {id_col}=={cand!r} (matches original .index[0] failure)"
       )
     xx = id_first[cand]
     xx_agg = basin.at[xx, "agg"]
-    if pd.isna(xx_agg) or _is_sentinel_object_id(xx_agg, outlet_value):
-      continue
     group_xx = agg_index.get(xx_agg, [])
     group_area = (
       float(basin.loc[group_xx, "_unitarea"].sort_index().sum()) if group_xx else 0.0
@@ -485,10 +470,8 @@ def rule_I_indexed(
 
     xz_agg_before = basin.at[xz, "agg"]
     zz_labels = list(aggdown_index.get(xz_agg_before, ()))
-
     xx_aggdown = basin.at[xx, "aggdown"]
 
-    # Line 1 — mask uses xz.agg *before* the write; then agg changes.
     pos1 = list(agg_index.get(xz_agg_before, ()))
     if pos1:
       basin.loc[pos1, "agg"] = xx_agg
@@ -496,72 +479,45 @@ def rule_I_indexed(
         agg_index[xx_agg].extend(pos1)
         del agg_index[xz_agg_before]
 
-    # Line 2 — mask uses xz.agg *after* line 1 (union of old xz group and
-    # whoever already had agg == xx_agg). Same as the original loc chain.
     xz_agg_after = basin.at[xz, "agg"]
     pos2 = list(agg_index.get(xz_agg_after, ()))
     _reassign_aggdown(basin, aggdown_index, pos2, xx_aggdown)
 
-    # zz was snapshotted before either write; only aggdown changes.
     if zz_labels:
       _reassign_aggdown(basin, aggdown_index, zz_labels, xx_agg)
 
   return basin
 
 
-def _rebuild_agg_basin(
-  basin: gpd.GeoDataFrame,
-  id_col: str,
-  down_col: str,
-  drop_small_outlets,
-) -> pd.DataFrame:
-  """Rebuild the working table. Same keys/sums as the original groupby."""
-  agg_basin = (
-    basin[["agg", "aggdown", "_unitarea"]]
-    .groupby(["agg", "aggdown"], as_index=False)
-    .agg({"_unitarea": "sum"})
-  )
-  agg_basin = agg_basin.rename(columns={"agg": id_col, "aggdown": down_col})
-  agg_basin = agg_basin.merge(basin[[id_col, "_uparea", "Mask"]], on=id_col, how="left")
-  agg_basin = agg_basin.rename(columns={id_col: "agg", down_col: "aggdown"})
-  return drop_small_outlets(agg_basin)
-
-
-def _mark_main_stems(
+def mark_main_stems(
   agg_river: gpd.GeoDataFrame,
   down_col: str,
   riv_id_col: str,
 ) -> gpd.GeoDataFrame:
-  """
-  Pick the highest-_uparea path inside each aggregate.
-
-  Equivalent to the original per-agg boolean scan; ``down_col`` is static
-  so its inverted index is built once.
-  """
+  """Highest-_uparea path per aggregate. Stops if a row is visited twice."""
   agg_river = agg_river.copy()
   agg_river["mask"] = 0
 
   down_index = _index_labels_by_value(agg_river[down_col])
   groups: dict[Any, list[Hashable]] = defaultdict(list)
-  # ``unique()`` is first-appearance order; groups are independent.
   for lab, agg_id in agg_river["agg"].items():
     if pd.isna(agg_id):
       continue
     groups[agg_id].append(lab)
 
-  for _agg_id, _members in groups.items():
-    xx = _members
-    visited = set()
+  for _agg_id, members in groups.items():
+    xx = members
+    visited: set[Hashable] = set()
     while True:
       yy = agg_river.loc[xx, "_uparea"].idxmax()
       if yy in visited:
-          break
+        break
       visited.add(yy)
       agg_river.at[yy, "mask"] = 1
       dest = agg_river.at[yy, riv_id_col]
       downstream = down_index.get(dest)
       if not downstream:
-          break
+        break
       xx = downstream
 
   return agg_river
@@ -589,7 +545,6 @@ def basin_aggregation(
   """
   outlet_value = int(outlet_value)
   basin, river = prepare_input_tables(input_basin, input_river)
-  area_guard = float(basin["_unitarea"].sum())
 
   id_col = BASIN_ID
   down_col = NEXT_DOWN_ID
@@ -617,12 +572,16 @@ def basin_aggregation(
   ] = outlet_value
 
   def _drop_small_outlets(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop terminal subbasins too small to keep; lakes always stay in the merge graph."""
     is_outlet = df["aggdown"].map(lambda d: _is_outlet_id(d, outlet_value))
-    return df[~(is_outlet & (df["_uparea"] < min_sub_area) | (df["Mask"] == 3))]
+    return df[(~(is_outlet & (df["_uparea"] < min_sub_area))) | (df["Mask"] == 3)]
 
   agg_basin = basin[["agg", "aggdown", "_unitarea", "_uparea", "Mask"]].copy()
   agg_basin = _drop_small_outlets(agg_basin)
-  lake_subs = basin[basin["Mask"] == 3]["agg"]
+  lake_subs = set(basin.loc[basin["Mask"] == 3, "agg"].astype(int))
+  post_lake_subs = _downstream_basin_ids_of_lakes(
+    basin, river, id_col, down_col, riv_id_col, outlet_value
+  )
   no_subbasin = len(basin)
 
   while True:
@@ -632,14 +591,23 @@ def basin_aggregation(
       & (agg_basin["Mask"] < 2)
     )
     small_subbasin = agg_basin[headwaters]
-    small_subbasin = small_subbasin[~small_subbasin["aggdown"].isin(lake_subs)].sort_values(
-      by="_uparea", ascending=False
-    )
+    small_subbasin = small_subbasin[
+      ~small_subbasin["aggdown"].isin(lake_subs)
+      # Post-lake basins may receive upstream headwaters (aggdown -> them) but must
+      # not themselves be absorbed into a basin further downstream (agg -> blocked).
+      & ~small_subbasin["agg"].isin(post_lake_subs)
+    ].sort_values(by="_uparea", ascending=False)
     if not small_subbasin.empty:
       small_subbasin = small_subbasin.rename(columns={"agg": "aggold", "aggdown": "agg"})
       xx = small_subbasin.merge(agg_basin[["agg", "aggdown"]], on="agg", how="left")
-      basin = rule_H_indexed(basin, xx, outlet_value=outlet_value)
-      agg_basin = _rebuild_agg_basin(basin, id_col, down_col, _drop_small_outlets)
+      basin = absorb_headwater_groups(basin, xx, outlet_value=outlet_value)
+      agg_basin = basin.drop(columns="geometry").groupby(["agg", "aggdown"], as_index=False).agg(
+        {"_unitarea": "sum"}
+      )
+      agg_basin = agg_basin.rename(columns={"agg": id_col, "aggdown": down_col})
+      agg_basin = agg_basin.merge(basin[[id_col, "_uparea", "Mask"]], on=id_col, how="left")
+      agg_basin = agg_basin.rename(columns={id_col: "agg", down_col: "aggdown"})
+      agg_basin = _drop_small_outlets(agg_basin)
 
     condition = (
       agg_basin["agg"].isin(agg_basin["aggdown"])
@@ -648,22 +616,25 @@ def basin_aggregation(
     )
     small_subbasin = agg_basin[condition].sort_values(by="_uparea", ascending=False)
     if not small_subbasin.empty:
-      basin = rule_I_indexed(
+      basin = absorb_internal_groups(
         basin,
         small_subbasin,
         id_col=id_col,
         down_col=down_col,
         min_sub_area=min_sub_area,
-        outlet_value=outlet_value,
       )
-      agg_basin = _rebuild_agg_basin(basin, id_col, down_col, _drop_small_outlets)
+      agg_basin = basin.drop(columns="geometry").groupby(["agg", "aggdown"], as_index=False).agg(
+        {"_unitarea": "sum"}
+      )
+      agg_basin = agg_basin.rename(columns={"agg": id_col, "aggdown": down_col})
+      agg_basin = agg_basin.merge(basin[[id_col, "_uparea", "Mask"]], on=id_col, how="left")
+      agg_basin = agg_basin.rename(columns={id_col: "agg", down_col: "aggdown"})
+      agg_basin = _drop_small_outlets(agg_basin)
 
     if len(agg_basin[agg_basin["_unitarea"] < min_sub_area]) == no_subbasin:
       break
     no_subbasin = len(agg_basin[agg_basin["_unitarea"] < min_sub_area])
 
-  # Never dissolve on the outlet sentinel: every coastal unit that drained
-  # to -9999 / <=0 would become one polygon. Split those rows back to self.
   sentinel_group = basin["agg"].map(lambda a: _is_sentinel_object_id(a, outlet_value))
   if sentinel_group.any():
     n_split = int(sentinel_group.sum())
@@ -678,30 +649,15 @@ def basin_aggregation(
   basin = _remap_aggdown_to_survivors(
     basin, id_col=id_col, outlet_value=outlet_value
   )
-  pour_down = _pour_point_down(basin, id_col)
+  pour_down = _one_row_per_agg(basin, id_col, ["aggdown"])
   basin = basin.drop(columns=["aggdown"]).merge(pour_down, on="agg", how="left")
-  basin["aggdown"] = basin["aggdown"].where(
-    basin["aggdown"].notna(), outlet_value
-  )
 
-  agg_basin = basin.dissolve(by="agg", aggfunc={"_unitarea": "sum"}, as_index=False).rename(
-    columns={"agg": id_col}
-  )
+  attr_cols = ["aggdown", "_uparea"] + _basin_attr_cols(basin)
+  pour_attrs = _one_row_per_agg(basin, id_col, attr_cols)
 
-  dissolved_area = float(agg_basin["_unitarea"].sum())
-  if abs(dissolved_area - area_guard) > 1e-6 * max(1.0, abs(area_guard)):
-    raise ValueError(
-      f"Unit-area sum changed during aggregation: {area_guard} -> {dissolved_area}"
-    )
-
-  # Carry pour-point attributes; object id remains BASIN_ID
-  keep_cols = [id_col, "aggdown", "_uparea"] + _basin_attr_cols(basin)
-  keep_cols = list(dict.fromkeys(keep_cols))
-  agg_basin = agg_basin.merge(
-    basin[keep_cols].copy(),
-    on=id_col,
-    how="left",
-  ).rename(columns={"aggdown": down_col})
+  agg_basin = basin.dissolve(by="agg", aggfunc={"_unitarea": "sum"}, as_index=False)
+  agg_basin = agg_basin.merge(pour_attrs, on="agg", how="left")
+  agg_basin = agg_basin.rename(columns={"agg": id_col, "aggdown": down_col})
 
   if id_col == riv_id_col:
     agg_river = river.merge(basin[[id_col, "agg"]].copy(), on=riv_id_col, how="left")
@@ -712,7 +668,7 @@ def basin_aggregation(
       right_on=id_col,
       how="left",
     )
-  agg_river = _mark_main_stems(agg_river, down_col=down_col, riv_id_col=riv_id_col)
+  agg_river = mark_main_stems(agg_river, down_col=down_col, riv_id_col=riv_id_col)
   agg_river = agg_river[agg_river["mask"] == 1].copy()
   agg_river["_slope_weighted"] = agg_river[SLOPE] * agg_river["_lengthkm"]
 
@@ -735,35 +691,31 @@ def basin_aggregation(
     extra_river_cols.append(HILLSLOPE)
   agg_river = agg_river.merge(river[extra_river_cols].copy(), on=riv_id_col, how="left")
 
-  unit_out = UNIT_AREA or "unit_a_km2"
+  unit_out = UNIT_AREA or "area_km2"
   agg_basin = agg_basin.rename(columns={"_unitarea": unit_out, "_uparea": UP_AREA})
-  agg_river[LENGTH] = agg_river["_lengthkm"]
-  agg_river[UP_AREA] = agg_river["_uparea"]
+  if UNIT_AREA and AREA_SCALE != 1.0:
+    agg_basin[unit_out] = agg_basin[unit_out] / AREA_SCALE
+  if AREA_SCALE != 1.0:
+    agg_basin[UP_AREA] = agg_basin[UP_AREA] / AREA_SCALE
+
+  agg_river[LENGTH] = agg_river["_lengthkm"] / LENGTH_SCALE
+  agg_river[UP_AREA] = agg_river["_uparea"] / AREA_SCALE
   drop_riv = ["_lengthkm", "_uparea", "_slope_weighted", "mask"]
   if id_col != riv_id_col and id_col in agg_river.columns:
     drop_riv.append(id_col)
   agg_river = agg_river.drop(columns=drop_riv, errors="ignore")
 
-  # Object IDs must stay real basin/reach IDs. Only DSLINKNO may be the sentinel.
-  sentinel_id = agg_basin[id_col].map(lambda a: _is_sentinel_object_id(a, outlet_value))
-  if sentinel_id.any():
-    print(
-      f"Warning: dropping {int(sentinel_id.sum())} dissolved basin(s) "
-      "whose LINKNO is an outlet sentinel."
-    )
-    agg_basin = agg_basin.loc[~sentinel_id].copy()
-
-  agg_basin[id_col] = _to_int64_link_ids(
-    agg_basin[id_col], outlet_value, f"basins.{id_col}", fill_outlets=False
+  agg_basin[id_col] = agg_basin[id_col].astype("int64")
+  agg_basin[down_col] = (
+    pd.to_numeric(agg_basin[down_col], errors="coerce")
+    .fillna(outlet_value)
+    .astype("int64")
   )
-  agg_basin[down_col] = _to_int64_link_ids(
-    agg_basin[down_col], outlet_value, f"basins.{down_col}", fill_outlets=True
-  )
-  agg_river[riv_id_col] = _to_int64_link_ids(
-    agg_river[riv_id_col], outlet_value, f"rivers.{riv_id_col}", fill_outlets=False
-  )
-  agg_river[down_col] = _to_int64_link_ids(
-    agg_river[down_col], outlet_value, f"rivers.{down_col}", fill_outlets=True
+  agg_river[riv_id_col] = agg_river[riv_id_col].astype("int64")
+  agg_river[down_col] = (
+    pd.to_numeric(agg_river[down_col], errors="coerce")
+    .fillna(outlet_value)
+    .astype("int64")
   )
 
   # Basin object ids (DN) match river LINKNO values after aggregation; expose a
@@ -812,12 +764,15 @@ def run_aggregation(
   os.makedirs(os.path.dirname(output_rivers_path) or ".", exist_ok=True)
 
   print(f"Writing aggregated basins ({len(agg_basins)} features): {output_basins_path}")
-  agg_basins.to_file(output_basins_path, driver="ESRI Shapefile")
+  from hy_features.export import export_shapefile_legacy
+
+  export_shapefile_legacy(agg_basins, output_basins_path)
   print(f"Writing aggregated rivers ({len(agg_rivers)} features): {output_rivers_path}")
-  agg_rivers.to_file(output_rivers_path, driver="ESRI Shapefile")
+  export_shapefile_legacy(agg_rivers, output_rivers_path)
 
   return agg_basins, agg_rivers
 
 
 if __name__ == "__main__":
+  ensure_output_dirs()
   run_aggregation()
